@@ -1,0 +1,995 @@
+diff --git a/include/mupdf/fitz/bidi.h b/include/mupdf/fitz/bidi.h
+index 6cae47f..cc86a11 100644
+--- a/include/mupdf/fitz/bidi.h
++++ b/include/mupdf/fitz/bidi.h
+@@ -80,6 +80,21 @@ typedef void (fz_bidi_fragment_fn)(const uint32_t *fragment,
+ 	@param[in] arg	data to be passed to the callback function
+ 	@param[in] flags     flags to control operation (see fz_bidi_flags above)
+ */
++/**
++	Helpers for callers that want to recognise the trivial case (a single
++	left-to-right fragment) without running the full algorithm.
++
++	fz_bidi_is_simple_ltr_char: non-zero if ch can not move text away from
++	level 0 in a left-to-right (or neutral) paragraph that contains no
++	other such characters (i.e. it is not R, AL, AN, B or an explicit
++	embedding/override/isolate control).
++
++	fz_bidi_guess_script_from_block: the script fz_bidi_fragment_text
++	guesses for a run made only of common/inherited characters.
++*/
++int fz_bidi_is_simple_ltr_char(int ch);
++int fz_bidi_guess_script_from_block(int ch);
++
+ void fz_bidi_fragment_text(fz_context *ctx,
+ 			const uint32_t *text,
+ 			size_t textlen,
+diff --git a/include/mupdf/fitz/font.h b/include/mupdf/fitz/font.h
+index c60fb7e..29423a1 100644
+--- a/include/mupdf/fitz/font.h
++++ b/include/mupdf/fitz/font.h
+@@ -823,6 +823,10 @@ struct fz_font
+ 
+ 	/* Which font to use in a collection. */
+ 	int subfont;
++
++	/* Opaque text shaping cache (owned by the html layout engine). */
++	void *shape_cache;
++	void (*drop_shape_cache)(fz_context *ctx, void *cache);
+ };
+ 
+ void fz_ft_lock(fz_context *ctx);
+diff --git a/include/mupdf/fitz/structured-text.h b/include/mupdf/fitz/structured-text.h
+index fa7173e..ab8ed5f 100644
+--- a/include/mupdf/fitz/structured-text.h
++++ b/include/mupdf/fitz/structured-text.h
+@@ -918,6 +918,15 @@ fz_search_options fz_parse_search_options(const char *options);
+ */
+ fz_search *fz_new_search(fz_context *ctx);
+ 
++/**
++	Return (in a new allocation) text transformed exactly as a search
++	with the given options (FZ_SEARCH_IGNORE_CASE and/or
++	FZ_SEARCH_IGNORE_DIACRITICS) transforms both haystack and needle
++	before comparing them. Lets callers build their own indexes that
++	agree with fz_match_stext_page_cb.
++*/
++char *fz_search_fold_text(fz_context *ctx, const char *text, fz_search_options options);
++
+ /**
+ 	Change the options/needle to be used for a search.
+ 
+diff --git a/source/fitz/bidi.c b/source/fitz/bidi.c
+index 6210f8c..04f6af5 100644
+--- a/source/fitz/bidi.c
++++ b/source/fitz/bidi.c
+@@ -439,6 +439,18 @@ guess_script_from_block(int c)
+ 	return UCDN_SCRIPT_COMMON;
+ }
+ 
++int fz_bidi_is_simple_ltr_char(int ch)
++{
++	fz_bidi_chartype t = class_from_ch_n(ch);
++	return !(t == BDI_R || t == BDI_AL || t == BDI_AN || t == BDI_B ||
++		t == BDI_RLO || t == BDI_RLE || t == BDI_LRO || t == BDI_LRE || t == BDI_PDF);
++}
++
++int fz_bidi_guess_script_from_block(int ch)
++{
++	return guess_script_from_block(ch);
++}
++
+ /* Split fragments into single scripts (or punctuation + single script) */
+ static void
+ split_at_script(const uint32_t *fragment,
+@@ -709,6 +721,28 @@ create_levels(fz_context *ctx,
+ 
+ 		classify_characters(text, types, len, flags);
+ 
++		/* Fast path: with no right-to-left, Arabic-number, paragraph or
++		 * explicit embedding characters and a left-to-right (or neutral)
++		 * base direction, every rule of the algorithm resolves to the
++		 * base level 0 (European numbers become L by W7 since sos is L). */
++		if (*baseDir != FZ_BIDI_RTL)
++		{
++			size_t i;
++			for (i = 0; i < len; i++)
++			{
++				fz_bidi_chartype t = types[i];
++				if (t == BDI_R || t == BDI_AL || t == BDI_AN || t == BDI_B ||
++					t == BDI_RLO || t == BDI_RLE || t == BDI_LRO || t == BDI_LRE || t == BDI_PDF)
++					break;
++			}
++			if (i == len)
++			{
++				*baseDir = FZ_BIDI_LTR;
++				memset(levels, 0, len * sizeof(*levels));
++				break;
++			}
++		}
++
+ 		if (*baseDir != FZ_BIDI_LTR && *baseDir != FZ_BIDI_RTL)
+ 		{
+ 			/* Derive the base level from the text and
+diff --git a/source/fitz/font.c b/source/fitz/font.c
+index 6c04e70..50c493a 100644
+--- a/source/fitz/font.c
++++ b/source/fitz/font.c
+@@ -248,6 +248,8 @@ fz_drop_font(fz_context *ctx, fz_font *font)
+ 	{
+ 		font->shaper_data.destroy(ctx, font->shaper_data.shaper_handle);
+ 	}
++	if (font->drop_shape_cache && font->shape_cache)
++		font->drop_shape_cache(ctx, font->shape_cache);
+ 	fz_free(ctx, font);
+ }
+ 
+diff --git a/source/fitz/memory.c b/source/fitz/memory.c
+index 539e096..ef3e137 100644
+--- a/source/fitz/memory.c
++++ b/source/fitz/memory.c
+@@ -47,6 +47,12 @@ do_scavenging_malloc(fz_context *ctx, size_t size)
+ 	void *p;
+ 	int phase = 0;
+ 
++#ifdef FZ_ALLOC_THREADSAFE
++	/* The allocator is thread safe: only take the lock to scavenge. */
++	p = ctx->alloc.malloc(ctx->alloc.user, size);
++	if (p != NULL)
++		return p;
++#endif
+ 	fz_lock(ctx, FZ_LOCK_ALLOC);
+ 	do {
+ 		p = ctx->alloc.malloc(ctx->alloc.user, size);
+@@ -67,6 +73,12 @@ do_scavenging_realloc(fz_context *ctx, void *p, size_t size)
+ 	void *q;
+ 	int phase = 0;
+ 
++#ifdef FZ_ALLOC_THREADSAFE
++	/* The allocator is thread safe: only take the lock to scavenge. */
++	q = ctx->alloc.realloc(ctx->alloc.user, p, size);
++	if (q != NULL)
++		return q;
++#endif
+ 	fz_lock(ctx, FZ_LOCK_ALLOC);
+ 	do {
+ 		q = ctx->alloc.realloc(ctx->alloc.user, p, size);
+@@ -169,9 +181,13 @@ fz_free(fz_context *ctx, void *p)
+ {
+ 	if (p)
+ 	{
++#ifdef FZ_ALLOC_THREADSAFE
++		ctx->alloc.free(ctx->alloc.user, p);
++#else
+ 		fz_lock(ctx, FZ_LOCK_ALLOC);
+ 		ctx->alloc.free(ctx->alloc.user, p);
+ 		fz_unlock(ctx, FZ_LOCK_ALLOC);
++#endif
+ 	}
+ }
+ 
+diff --git a/source/fitz/stext-search.c b/source/fitz/stext-search.c
+index 7c0676e..fcba658 100644
+--- a/source/fitz/stext-search.c
++++ b/source/fitz/stext-search.c
+@@ -1095,6 +1095,19 @@ do_transform(fz_context *ctx, fz_text_transform transform, char *output, size_t
+ 	return byte_len;
+ }
+ 
++static fz_text_transform split_options(fz_search_options options, const fz_match_finder **finder);
++
++char *
++fz_search_fold_text(fz_context *ctx, const char *text, fz_search_options options)
++{
++	const fz_match_finder *finder;
++	fz_text_transform t = split_options(options & (FZ_SEARCH_IGNORE_CASE | FZ_SEARCH_IGNORE_DIACRITICS), &finder);
++	size_t len = do_transform(ctx, t, NULL, NULL, text);
++	char *out = fz_malloc(ctx, len);
++	do_transform(ctx, t, out, NULL, text);
++	return out;
++}
++
+ static char *
+ transform_text_with_index(fz_context *ctx, fz_text_transform transform, const char *input, size_t **indexp)
+ {
+diff --git a/source/html/html-imp.h b/source/html/html-imp.h
+index c5338fa..5ed113c 100644
+--- a/source/html/html-imp.h
++++ b/source/html/html-imp.h
+@@ -479,6 +479,10 @@ struct fz_html_box_s
+ 
+ 	const char *tag, *id, *href;
+ 	const fz_css_style *style;
++
++	/* Lazily built index of the children by vertical extent, used to
++	 * draw a page without visiting every child (see html-layout.c). */
++	struct fz_html_child_index *child_index;
+ #ifdef DEBUG_HTML_SEQ
+ 	int seq;
+ #endif
+@@ -558,6 +562,7 @@ struct fz_html_flow_s
+ 	float x, y, w, h;
+ 	fz_html_box *box; /* for style and em */
+ 	fz_html_flow *next;
++	void *shape; /* last shaping cache entry used for this node (validated on use) */
+ 	union {
+ 		char text[1];
+ 		fz_image *image;
+diff --git a/source/html/html-layout.c b/source/html/html-layout.c
+index 7a0a673..1edc98c 100644
+--- a/source/html/html-layout.c
++++ b/source/html/html-layout.c
+@@ -29,6 +29,7 @@
+ #include <ft2build.h>
+ 
+ #include <math.h>
++#include <float.h>
+ #include <assert.h>
+ 
+ #undef DEBUG_HARFBUZZ
+@@ -112,8 +113,143 @@
+ 
+ enum { T, R, B, L };
+ 
++/* Bumped by every layout; invalidates the per-box child indices used when drawing. */
++static int html_layout_gen = 1;
++#define LAYOUT_GEN() __atomic_load_n(&html_layout_gen, __ATOMIC_ACQUIRE)
++
+ /* === LAYOUT INLINE TEXT === */
+ 
++/*
++	Shaping cache.
++
++	Shaping a string (fallback font selection, FT_Set_Char_Size, HarfBuzz)
++	is by far the most expensive part of laying out and drawing an ebook,
++	and natural text repeats the same short strings ("the", " ", ...) over
++	and over. Each base font carries a hash table mapping (text, script,
++	language, direction, small-caps, cluster mode) to the exact segments
++	that walk_string produced for it, so later walks just replay them.
++	Results are identical to an uncached walk. Entries live in an arena
++	that is freed with the font.
++
++	Lookups take no lock: entries are immutable once published, buckets
++	are published with release stores, and a grown table replaces the old
++	one atomically (old tables are kept until the font is dropped). A
++	reader racing a resize can at worst miss, which just means the string
++	is shaped again and the existing entry is found by shape_commit.
++*/
++
++#define SHAPE_MAX_TEXT 48
++#define SHAPE_MAX_GLYPHS 64
++#define SHAPE_MAX_SEGS 4
++
++typedef struct
++{
++	fz_font *font;
++	int scale;
++	int xsum;
++	unsigned short start, end, first, count;
++} shape_seg;
++
++typedef struct shape_entry
++{
++	struct shape_entry *next;
++	fz_font *font;
++	uint64_t key;
++	uint32_t hash;
++	unsigned short len, nseg;
++	shape_seg *seg;
++	hb_glyph_info_t *info;
++	hb_glyph_position_t *pos;
++	char text[1];
++} shape_entry;
++
++typedef struct shape_block
++{
++	struct shape_block *next;
++	size_t used, cap;
++	char data[1];
++} shape_block;
++
++typedef struct shape_table
++{
++	struct shape_table *older;
++	unsigned int mask;
++	shape_entry *tab[1];
++} shape_table;
++
++typedef struct
++{
++	shape_table *table;
++	unsigned int count;
++	shape_block *blocks;
++} shape_cache;
++
++static void drop_shape_cache(fz_context *ctx, void *arg)
++{
++	shape_cache *c = arg;
++	shape_block *b = c->blocks;
++	shape_table *t = c->table;
++	while (b)
++	{
++		shape_block *n = b->next;
++		fz_free(ctx, b);
++		b = n;
++	}
++	while (t)
++	{
++		shape_table *o = t->older;
++		fz_free(ctx, t);
++		t = o;
++	}
++	fz_free(ctx, c);
++}
++
++static shape_table *new_shape_table(fz_context *ctx, unsigned int mask)
++{
++	shape_table *t = fz_malloc(ctx, offsetof(shape_table, tab) + sizeof(shape_entry *) * (mask + 1));
++	memset(t, 0, offsetof(shape_table, tab) + sizeof(shape_entry *) * (mask + 1));
++	t->mask = mask;
++	return t;
++}
++
++static void *shape_alloc(fz_context *ctx, shape_cache *c, size_t n)
++{
++	shape_block *b = c->blocks;
++	n = (n + 7) & ~(size_t)7;
++	if (!b || b->used + n > b->cap)
++	{
++		size_t cap = n > 60000 ? n : 60000;
++		b = fz_malloc(ctx, offsetof(shape_block, data) + cap);
++		b->used = 0;
++		b->cap = cap;
++		b->next = c->blocks;
++		c->blocks = b;
++	}
++	b->used += n;
++	return b->data + b->used - n;
++}
++
++static uint32_t shape_hash(const char *s, size_t n, uint64_t key)
++{
++	uint32_t h = 2166136261u ^ (uint32_t)key ^ (uint32_t)(key >> 32) * 16777619u;
++	while (n--)
++		h = (h ^ (unsigned char)*s++) * 16777619u;
++	return h ^ (h >> 15);
++}
++
++static shape_entry *shape_lookup(shape_cache *c, const char *s, size_t n, uint64_t key, uint32_t h)
++{
++	shape_table *t;
++	shape_entry *e;
++	if (!c)
++		return NULL;
++	t = __atomic_load_n(&c->table, __ATOMIC_ACQUIRE);
++	for (e = __atomic_load_n(&t->tab[h & t->mask], __ATOMIC_ACQUIRE); e; e = __atomic_load_n(&e->next, __ATOMIC_ACQUIRE))
++		if (e->hash == h && e->key == key && e->len == n && !memcmp(e->text, s, n))
++			return e;
++	return NULL;
++}
++
+ typedef struct string_walker
+ {
+ 	fz_context *ctx;
+@@ -133,6 +269,20 @@ typedef struct string_walker
+ 	unsigned int glyph_count;
+ 	int scale;
+ 	int graphemes;
++
++	/* shaping cache state */
++	fz_html_flow *node;
++	const char *text;
++	size_t len;
++	uint64_t key;
++	uint32_t hash;
++	shape_entry *hit;
++	int seg_i;
++	int recording;
++	int nseg, nglyph;
++	shape_seg rec[SHAPE_MAX_SEGS];
++	hb_glyph_info_t ginfo[SHAPE_MAX_GLYPHS];
++	hb_glyph_position_t gpos[SHAPE_MAX_GLYPHS];
+ } string_walker;
+ 
+ static int quick_ligature_mov(fz_context *ctx, string_walker *walker, unsigned int i, unsigned int n, int unicode)
+@@ -180,7 +330,7 @@ static int quick_ligature(fz_context *ctx, string_walker *walker, unsigned int i
+ 	return walker->glyph_info[i].codepoint;
+ }
+ 
+-static void init_string_walker(fz_context *ctx, string_walker *walker, hb_buffer_t *hb_buf, int rtl, fz_font *font, int script, int language, int small_caps, const char *text, int cluster_as_graphemes)
++static void init_string_walker_node(fz_context *ctx, string_walker *walker, hb_buffer_t *hb_buf, int rtl, fz_font *font, int script, int language, int small_caps, const char *text, int cluster_as_graphemes, fz_html_flow *node)
+ {
+ 	walker->ctx = ctx;
+ 	walker->hb_buf = hb_buf;
+@@ -195,6 +345,144 @@ static void init_string_walker(fz_context *ctx, string_walker *walker, hb_buffer
+ 	walker->next_font = NULL;
+ 	walker->small_caps = small_caps;
+ 	walker->graphemes = cluster_as_graphemes;
++
++	walker->text = text;
++	walker->node = node;
++	walker->hit = NULL;
++	walker->recording = 0;
++	walker->seg_i = 0;
++	walker->nseg = walker->nglyph = 0;
++	walker->len = strlen(text);
++	if (font && walker->len <= SHAPE_MAX_TEXT)
++	{
++		shape_entry *e = node ? node->shape : NULL;
++		walker->key = (uint64_t)(unsigned int)language | ((uint64_t)(unsigned int)script << 16) |
++			((uint64_t)(rtl != 0) << 40) | ((uint64_t)(small_caps != 0) << 41) | ((uint64_t)(cluster_as_graphemes != 0) << 42);
++		/* Entries are immutable once published, so the node's remembered
++		 * entry can be checked without the lock. */
++		if (e && e->font == font && e->key == walker->key && e->len == walker->len && !memcmp(e->text, text, walker->len))
++		{
++			walker->hit = e;
++			return;
++		}
++		walker->hash = shape_hash(text, walker->len, walker->key);
++		walker->hit = shape_lookup(__atomic_load_n((shape_cache **)&font->shape_cache, __ATOMIC_ACQUIRE), text, walker->len, walker->key, walker->hash);
++		walker->recording = walker->hit == NULL;
++		if (node && walker->hit)
++			node->shape = walker->hit;
++	}
++}
++
++static void init_string_walker(fz_context *ctx, string_walker *walker, hb_buffer_t *hb_buf, int rtl, fz_font *font, int script, int language, int small_caps, const char *text, int cluster_as_graphemes)
++{
++	init_string_walker_node(ctx, walker, hb_buf, rtl, font, script, language, small_caps, text, cluster_as_graphemes, NULL);
++}
++
++static void shape_commit(fz_context *ctx, string_walker *w)
++{
++	fz_font *font = w->base_font;
++	shape_cache *c;
++	shape_entry *e;
++	int i;
++
++	w->recording = 0;
++	fz_hb_lock(ctx);
++	fz_try(ctx)
++	{
++		c = font->shape_cache;
++		if (!c)
++		{
++			c = fz_malloc_struct(ctx, shape_cache);
++			fz_try(ctx)
++				c->table = new_shape_table(ctx, 1023);
++			fz_catch(ctx)
++			{
++				fz_free(ctx, c);
++				fz_rethrow(ctx);
++			}
++			font->drop_shape_cache = drop_shape_cache;
++			__atomic_store_n((shape_cache **)&font->shape_cache, c, __ATOMIC_RELEASE);
++		}
++		e = shape_lookup(c, w->text, w->len, w->key, w->hash);
++		if (!e)
++		{
++			shape_table *t = c->table;
++			if (c->count >= t->mask)
++			{
++				/* Grow into a new table. Entries are re-linked, so a
++				 * concurrent reader of the old table may miss; that is
++				 * harmless (see above). */
++				shape_table *nt = new_shape_table(ctx, t->mask * 2 + 1);
++				unsigned int k;
++				for (k = 0; k <= t->mask; k++)
++				{
++					shape_entry *x = t->tab[k];
++					while (x)
++					{
++						shape_entry *nx = x->next;
++						x->next = nt->tab[x->hash & nt->mask];
++						nt->tab[x->hash & nt->mask] = x;
++						x = nx;
++					}
++				}
++				nt->older = t;
++				__atomic_store_n(&c->table, nt, __ATOMIC_RELEASE);
++				t = nt;
++			}
++			e = shape_alloc(ctx, c, offsetof(shape_entry, text) + w->len + 1);
++			memcpy(e->text, w->text, w->len + 1);
++			e->font = font;
++			e->len = (unsigned short)w->len;
++			e->key = w->key;
++			e->hash = w->hash;
++			e->nseg = (unsigned short)w->nseg;
++			e->seg = shape_alloc(ctx, c, sizeof(shape_seg) * (w->nseg + 1));
++			e->info = shape_alloc(ctx, c, sizeof(hb_glyph_info_t) * (w->nglyph + 1));
++			e->pos = shape_alloc(ctx, c, sizeof(hb_glyph_position_t) * (w->nglyph + 1));
++			for (i = 0; i < w->nseg; i++)
++				e->seg[i] = w->rec[i];
++			memcpy(e->info, w->ginfo, sizeof(hb_glyph_info_t) * w->nglyph);
++			memcpy(e->pos, w->gpos, sizeof(hb_glyph_position_t) * w->nglyph);
++			e->next = t->tab[w->hash & t->mask];
++			__atomic_store_n(&t->tab[w->hash & t->mask], e, __ATOMIC_RELEASE);
++			c->count++;
++		}
++		if (w->node)
++			w->node->shape = e;
++	}
++	fz_always(ctx)
++		fz_hb_unlock(ctx);
++	fz_catch(ctx)
++	{
++		/* caching is optional */
++		fz_rethrow_if(ctx, FZ_ERROR_SYSTEM);
++		fz_report_error(ctx);
++	}
++}
++
++static void shape_record(string_walker *w)
++{
++	unsigned int i;
++	int xsum = 0;
++	shape_seg *sg;
++	if (w->nseg >= SHAPE_MAX_SEGS || w->nglyph + w->glyph_count > SHAPE_MAX_GLYPHS)
++	{
++		w->recording = 0;
++		return;
++	}
++	for (i = 0; i < w->glyph_count; i++)
++		xsum += w->glyph_pos[i].x_advance;
++	sg = &w->rec[w->nseg++];
++	sg->font = w->font;
++	sg->scale = w->scale;
++	sg->xsum = xsum;
++	sg->start = (unsigned short)(w->start - w->text);
++	sg->end = (unsigned short)(w->end - w->text);
++	sg->first = (unsigned short)w->nglyph;
++	sg->count = (unsigned short)w->glyph_count;
++	memcpy(w->ginfo + w->nglyph, w->glyph_info, sizeof(hb_glyph_info_t) * w->glyph_count);
++	memcpy(w->gpos + w->nglyph, w->glyph_pos, sizeof(hb_glyph_position_t) * w->glyph_count);
++	w->nglyph += w->glyph_count;
+ }
+ 
+ static void
+@@ -217,12 +505,39 @@ static int walk_string(string_walker *walker)
+ 	int quickshape;
+ 	char lang[8];
+ 
++	if (walker->hit)
++	{
++		shape_entry *e = walker->hit;
++		shape_seg *sg;
++		if (walker->seg_i >= e->nseg)
++		{
++			walker->start = walker->end = walker->s = walker->text + e->len;
++			return 0;
++		}
++		sg = &e->seg[walker->seg_i++];
++		walker->start = walker->text + sg->start;
++		walker->end = walker->s = walker->text + sg->end;
++		walker->font = walker->next_font = sg->font;
++		walker->scale = sg->scale;
++		walker->glyph_count = sg->count;
++		/* callers may modify the arrays, so hand them a copy */
++		memcpy(walker->ginfo, e->info + sg->first, sizeof(hb_glyph_info_t) * sg->count);
++		memcpy(walker->gpos, e->pos + sg->first, sizeof(hb_glyph_position_t) * sg->count);
++		walker->glyph_info = walker->ginfo;
++		walker->glyph_pos = walker->gpos;
++		return 1;
++	}
++
+ 	walker->start = walker->end;
+ 	walker->end = walker->s;
+ 	walker->font = walker->next_font;
+ 
+ 	if (*walker->start == 0)
++	{
++		if (walker->recording)
++			shape_commit(ctx, walker);
+ 		return 0;
++	}
+ 
+ 	/* Run through the string, encoding chars until we find one
+ 	 * that requires a different fallback font. */
+@@ -322,6 +637,9 @@ static int walk_string(string_walker *walker)
+ 		}
+ 	}
+ 
++	if (walker->recording)
++		shape_record(walker);
++
+ 	return 1;
+ }
+ 
+@@ -345,7 +663,15 @@ static void measure_string_w(fz_context *ctx, fz_html_flow *node, hb_buffer_t *h
+ 	const char *s;
+ 	node->w = 0;
+ 	s = get_node_text(ctx, node);
+-	init_string_walker(ctx, &walker, hb_buf, node->bidi_level & 1, node->box->style->font, node->script, node->markup_lang, node->box->style->small_caps, s, 0);
++	init_string_walker_node(ctx, &walker, hb_buf, node->bidi_level & 1, node->box->style->font, node->script, node->markup_lang, node->box->style->small_caps, s, 0, node);
++	if (walker.hit)
++	{
++		/* same arithmetic as the loop below, without copying glyphs */
++		int k;
++		for (k = 0; k < walker.hit->nseg; k++)
++			node->w += walker.hit->seg[k].xsum * em / walker.hit->seg[k].scale;
++		return;
++	}
+ 	while (walk_string(&walker))
+ 	{
+ 		int x = 0;
+@@ -3135,6 +3461,8 @@ fz_restartable_layout_html(fz_context *ctx, fz_html_tree *tree, float start_x, f
+ 	fz_var(ld.hb_buf);
+ 	fz_var(unlocked);
+ 
++	__atomic_add_fetch(&html_layout_gen, 1, __ATOMIC_ACQ_REL); /* invalidates all child indices */
++
+ 	// nothing to layout
+ 	if (!box->down)
+ 	{
+@@ -3438,7 +3766,7 @@ static int draw_flow_box(fz_context *ctx, fz_html_box *box, float page_top, floa
+ 				trm.f = y - page_top;
+ 
+ 				s = get_node_text(ctx, node);
+-				init_string_walker(ctx, &walker, hb_buf, node->bidi_level & 1, style->font, node->script, node->markup_lang, style->small_caps, s, 0);
++				init_string_walker_node(ctx, &walker, hb_buf, node->bidi_level & 1, style->font, node->script, node->markup_lang, style->small_caps, s, 0, node);
+ 				while (walk_string(&walker))
+ 				{
+ 					float node_scale = node->box->s.layout.em / walker.scale;
+@@ -3874,10 +4202,178 @@ static void draw_list_mark(fz_context *ctx, fz_html_box *box, float page_top, fl
+ static int draw_block_box(fz_context *ctx, fz_html_box *box, float page_top, float page_bot, fz_device *dev, fz_matrix ctm, hb_buffer_t *hb_buf, fz_html_restarter *restart);
+ static int draw_table_row(fz_context *ctx, fz_html_box *box, float page_top, float page_bot, fz_device *dev, fz_matrix ctm, hb_buffer_t *hb_buf, fz_html_restarter *restart);
+ 
++/* Vertical extent used by draw_block_box and draw_table_row to bail out.
++ * Returns 0 for boxes that are always visited. */
++static int box_extent(fz_html_box *box, float *y0, float *y1)
++{
++	switch (box->type)
++	{
++	case BOX_TABLE_ROW:
++		*y0 = box->s.layout.y;
++		*y1 = box->s.layout.b;
++		return 1;
++	case BOX_TABLE:
++	case BOX_TABLE_CELL:
++	case BOX_BLOCK:
++		*y0 = box->s.layout.y - box->u.block.padding[T];
++		*y1 = box->s.layout.b + box->u.block.padding[B];
++		return 1;
++	default:
++		return 0;
++	}
++}
++
++static int box_is_off_page(fz_html_box *box, float page_top, float page_bot)
++{
++	float y0, y1;
++	if (!box_extent(box, &y0, &y1))
++		return 0;
++	return y0 > page_bot || y1 < page_top;
++}
++
++/*
++	Child index: for a box with many children, the running maximum of the
++	children's bottom edges and the trailing minimum of their top edges.
++	Both arrays are non-decreasing, so binary search gives the exact range
++	of children that box_is_off_page would not reject. Rebuilt whenever
++	any layout has run since it was made.
++*/
++#define CHILD_INDEX_MIN 24
++
++
++struct fz_html_child_index
++{
++	int gen, n, cap;
++	fz_html_box **child;
++	float *pmax1, *smin0;
++};
++
++void fz_drop_html_child_index(fz_context *ctx, struct fz_html_child_index *ix)
++{
++	fz_free(ctx, ix->child);
++	fz_free(ctx, ix->pmax1);
++	fz_free(ctx, ix->smin0);
++	fz_free(ctx, ix);
++}
++
++static struct fz_html_child_index *get_child_index(fz_context *ctx, fz_html_box *box)
++{
++	struct fz_html_child_index *ix = box->child_index;
++	fz_html_box *c;
++	int n, i;
++	float m;
++
++	int gen = LAYOUT_GEN();
++
++	if (ix && ix->gen == gen)
++		return ix->n >= CHILD_INDEX_MIN ? ix : NULL;
++
++	for (n = 0, c = box->down; c; c = c->next)
++		n++;
++
++	fz_try(ctx)
++	{
++		if (!ix)
++		{
++			ix = fz_malloc_struct(ctx, struct fz_html_child_index);
++			box->child_index = ix;
++		}
++		ix->gen = 0;
++		ix->n = n;
++		if (n >= CHILD_INDEX_MIN && n > ix->cap)
++		{
++			ix->child = fz_realloc_array(ctx, ix->child, n, fz_html_box *);
++			ix->pmax1 = fz_realloc_array(ctx, ix->pmax1, n, float);
++			ix->smin0 = fz_realloc_array(ctx, ix->smin0, n, float);
++			ix->cap = n;
++		}
++	}
++	fz_catch(ctx)
++	{
++		fz_rethrow_if(ctx, FZ_ERROR_SYSTEM);
++		fz_report_error(ctx);
++		return NULL;
++	}
++
++	if (n >= CHILD_INDEX_MIN)
++	{
++		m = -FLT_MAX;
++		for (i = 0, c = box->down; c; c = c->next, i++)
++		{
++			float y0, y1;
++			if (!box_extent(c, &y0, &y1))
++				y1 = FLT_MAX;
++			if (y1 > m)
++				m = y1;
++			ix->child[i] = c;
++			ix->pmax1[i] = m;
++		}
++		m = FLT_MAX;
++		for (i = n - 1; i >= 0; i--)
++		{
++			float y0, y1;
++			if (!box_extent(ix->child[i], &y0, &y1))
++				y0 = -FLT_MAX;
++			if (y0 < m)
++				m = y0;
++			ix->smin0[i] = m;
++		}
++	}
++	ix->gen = gen;
++	return n >= CHILD_INDEX_MIN ? ix : NULL;
++}
++
++static int draw_box(fz_context *ctx, fz_html_box *box, float page_top, float page_bot, fz_device *dev, fz_matrix ctm, hb_buffer_t *hb_buf, fz_html_restarter *restart);
++
++/* Draw the children of box, returning 1 if a restart point stopped us. */
++static int draw_children(fz_context *ctx, fz_html_box *box, float page_top, float page_bot, fz_device *dev, fz_matrix ctm, hb_buffer_t *hb_buf, fz_html_restarter *restart)
++{
++	fz_html_box *child;
++	if (!restart)
++	{
++		struct fz_html_child_index *ix = get_child_index(ctx, box);
++		if (ix)
++		{
++			int lo = 0, hi = ix->n, a, b, i;
++			/* first child whose running max bottom reaches page_top */
++			while (lo < hi)
++			{
++				int mid = (lo + hi) >> 1;
++				if (ix->pmax1[mid] < page_top) lo = mid + 1; else hi = mid;
++			}
++			a = lo;
++			/* first child after which every top is below page_bot */
++			lo = 0, hi = ix->n;
++			while (lo < hi)
++			{
++				int mid = (lo + hi) >> 1;
++				if (ix->smin0[mid] > page_bot) hi = mid; else lo = mid + 1;
++			}
++			b = lo;
++			for (i = a; i < b; i++)
++				if (draw_box(ctx, ix->child[i], page_top, page_bot, dev, ctm, hb_buf, restart))
++					return 1;
++			return 0;
++		}
++	}
++	for (child = box->down; child; child = child->next)
++		if (draw_box(ctx, child, page_top, page_bot, dev, ctm, hb_buf, restart))
++			return 1;
++	return 0;
++}
++
+ static int draw_box(fz_context *ctx, fz_html_box *box, float page_top, float page_bot, fz_device *dev, fz_matrix ctm, hb_buffer_t *hb_buf, fz_html_restarter *restart)
+ {
+ 	int ret = 0;
+-	int str = fz_html_tag_to_structure(box->tag);
++	int str;
++
++	/* A box entirely outside the page draws nothing; skip it before emitting
++	 * structure markers, otherwise every page carries a structure node for
++	 * every box in the document (quadratic for single-file books). */
++	if (!(restart && restart->end == box) && box_is_off_page(box, page_top, page_bot))
++		return 0;
++
++	str = fz_html_tag_to_structure(box->tag);
+ 
+ 	if (str != FZ_STRUCTURE_INVALID)
+ 		fz_begin_structure(ctx, dev, str, box->tag, 0);
+@@ -4392,14 +4888,7 @@ static int draw_block_box(fz_context *ctx, fz_html_box *box, float page_top, flo
+ 		}
+ 	}
+ 
+-	for (child = box->down; child; child = child->next)
+-	{
+-		if (draw_box(ctx, child, page_top, page_bot, dev, ctm, hb_buf, restart))
+-		{
+-			stopped = 1;
+-			break;
+-		}
+-	}
++	stopped = draw_children(ctx, box, page_top, page_bot, dev, ctm, hb_buf, restart);
+ 
+ 	if (box->style->visibility == V_VISIBLE && restart && restart->start == NULL)
+ 	{
+@@ -4473,9 +4962,8 @@ fz_draw_restarted_html(fz_context *ctx, fz_device *dev, fz_matrix ctm, fz_html_b
+ 		fz_hb_unlock(ctx);
+ 		unlocked = 1;
+ 
+-		for (box = top->down; box; box = box->next)
+-			if (draw_box(ctx, box, page_top, page_bot, dev, ctm, hb_buf, restart))
+-				break;
++		(void)box;
++		draw_children(ctx, top, page_top, page_bot, dev, ctm, hb_buf, restart);
+ 	}
+ 	fz_always(ctx)
+ 	{
+diff --git a/source/html/html-parse.c b/source/html/html-parse.c
+index de816eb..21461cc 100644
+--- a/source/html/html-parse.c
++++ b/source/html/html-parse.c
+@@ -731,11 +731,15 @@ static void generate_image(fz_context *ctx, fz_html_box *box, fz_image *img, str
+ 	g->at_bol = 0;
+ }
+ 
++void fz_drop_html_child_index(fz_context *ctx, struct fz_html_child_index *ix);
++
+ static void fz_drop_html_box(fz_context *ctx, fz_html_box *box)
+ {
+ 	while (box)
+ 	{
+ 		fz_html_box *next = box->next;
++		if (box->child_index)
++			fz_drop_html_child_index(ctx, box->child_index);
+ 		if (box->type == BOX_FLOW)
+ 			fz_drop_html_flow(ctx, box->u.flow.head);
+ 		fz_drop_html_box(ctx, box->down);
+@@ -1735,6 +1739,120 @@ static void fragment_cb(const uint32_t *fragment,
+ 	}
+ }
+ 
++/*
++	Fast path for detect_flow_directionality. Most text is left-to-right in
++	a single script; for such a group fz_bidi_fragment_text would produce
++	exactly one fragment at level 0, so assign that directly instead of
++	building the UTF-32 buffer and running the full algorithm.
++	Returns 1 and the end of the group in *endp, or 0 if the group needs
++	the full treatment (nothing has been modified in that case).
++*/
++static unsigned char ascii_simple[128], ascii_script[128];
++static int ascii_tables_ready;
++
++static void init_ascii_tables(void)
++{
++	/* Idempotent; concurrent initialisers write identical values. */
++	int c;
++	for (c = 0; c < 128; c++)
++	{
++		ascii_simple[c] = (unsigned char)fz_bidi_is_simple_ltr_char(c);
++		ascii_script[c] = (unsigned char)ucdn_get_script(c);
++	}
++	__atomic_store_n(&ascii_tables_ready, 1, __ATOMIC_RELEASE);
++}
++
++static int
++fast_flow_directionality(fz_html_flow *flow, fz_bidi_direction *bidi_dir, fz_html_flow **endp)
++{
++	fz_html_flow *end = flow, *f;
++	unsigned int level = flow->bidi_level;
++	int script = UCDN_SCRIPT_COMMON;
++	int guess = UCDN_SCRIPT_COMMON;
++	size_t total = 0;
++
++	if (*bidi_dir == FZ_BIDI_RTL)
++		return 0;
++	if (!__atomic_load_n(&ascii_tables_ready, __ATOMIC_ACQUIRE))
++		init_ascii_tables();
++
++	/* Same grouping as the slow path below. */
++	while (end && (level & 1) == (end->bidi_level & 1))
++	{
++		const char *text = "";
++		int broken = 0;
++
++		switch (end->type)
++		{
++		case FLOW_WORD: text = end->content.text; break;
++		case FLOW_SPACE: text = " "; break;
++		case FLOW_SHYPHEN:
++		case FLOW_SBREAK: break;
++		case FLOW_BREAK:
++		case FLOW_IMAGE: broken = 1; break;
++		}
++		end = end->next;
++
++		while (*text)
++		{
++			int c, s;
++			if ((unsigned char)*text < 128)
++			{
++				c = (unsigned char)*text++;
++				if (!ascii_simple[c])
++					return 0;
++				s = ascii_script[c];
++			}
++			else
++			{
++				text += fz_chartorune(&c, text);
++				if (!fz_bidi_is_simple_ltr_char(c))
++					return 0;
++				s = ucdn_get_script(c);
++			}
++			total++;
++			/* mirror split_at_script */
++			if (s == UCDN_SCRIPT_COMMON || s == UCDN_SCRIPT_INHERITED || s == UCDN_SCRIPT_UNKNOWN)
++			{
++				if (guess == UCDN_SCRIPT_COMMON)
++					guess = fz_bidi_guess_script_from_block(c);
++			}
++			else if (s != script)
++			{
++				if (script != UCDN_SCRIPT_COMMON && script != UCDN_SCRIPT_INHERITED && script != UCDN_SCRIPT_UNKNOWN)
++					return 0; /* would split into several fragments */
++				script = s;
++			}
++		}
++		if (broken)
++			break;
++	}
++
++	*endp = end;
++
++	/* fz_bidi_fragment_text does nothing at all for empty text. */
++	if (total == 0)
++		return 1;
++
++	if (script == UCDN_SCRIPT_COMMON)
++		script = guess;
++	*bidi_dir = FZ_BIDI_LTR;
++
++	/* mirror fragment_cb: visit flows until the text is used up */
++	for (f = flow; total > 0; f = f->next)
++	{
++		size_t len = 0;
++		if (f->type == FLOW_SPACE)
++			len = 1;
++		else if (f->type == FLOW_WORD)
++			len = fz_utflen(f->content.text);
++		f->bidi_level = 0;
++		f->script = script;
++		total -= len;
++	}
++	return 1;
++}
++
+ static fz_bidi_direction
+ detect_flow_directionality(fz_context *ctx, fz_pool *pool, uni_buf *buffer, fz_bidi_direction bidi_dir, fz_html_flow *flow)
+ {
+@@ -1744,6 +1862,12 @@ detect_flow_directionality(fz_context *ctx, fz_pool *pool, uni_buf *buffer, fz_b
+ 	while (end)
+ 	{
+ 		unsigned int level = end->bidi_level;
++		fz_html_flow *fast_end;
++		if (fast_flow_directionality(end, &bidi_dir, &fast_end))
++		{
++			flow = end = fast_end;
++			continue;
++		}
+ 
+ 		/* Gather the text from the flow up into a single buffer (at
+ 		 * least, as much of it as has the same direction markup). */

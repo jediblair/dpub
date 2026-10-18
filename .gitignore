@@ -1,0 +1,10 @@
+dpub.exe
+*.o
+*.exe
+dpub.ini
+third_party/*
+!third_party/mk.sh
+!third_party/pgo.sh
+!third_party/mupdf-patches.diff
+bench/*.bin
+bench/verify.txt

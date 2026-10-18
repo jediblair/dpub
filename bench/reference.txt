@@ -1,0 +1,13 @@
+war.mobi em=12 pages=1234 hits=2453 md5=48cd41b4cb469daba8816b90cbeff692
+war.mobi em=17 pages=2598 hits=1088 md5=0ca350aae9536054e360a59a18fac2bd
+bible.mobi em=12 pages=1689 hits=3361 md5=5fb3edb8169c3593e3923e3db08cf1ad
+bible.mobi em=17 pages=3498 hits=1675 md5=a756bb73659408b92add6a04c50226f7
+war.epub em=12 pages=1415 hits=2081 md5=2fcbf32216f235b680f89ca066631c17
+war.epub em=17 pages=2824 hits=907 md5=c59a6b26c40f153f760d481d3cb76d77
+bible.epub em=12 pages=1726 hits=3351 md5=ca9f35bb710859dc8281530b40224534
+bible.epub em=17 pages=3596 hits=1754 md5=187daaa54e67be404d65cf44054829b8
+alice.epub em=12 pages=78 hits=2529 md5=333df32407392c1275e555931bde830b
+alice.epub em=17 pages=154 hits=1186 md5=dbe6e904b78f93b868baeb9f505ac5ad
+alice.mobi em=12 pages=88 hits=2535 md5=059b3313f42a745e7c6c272998ec4654
+alice.mobi em=17 pages=168 hits=1278 md5=45a719cef5f62949e80309e84c26126c
+pdfref.pdf em=12 pages=756 hits=2171 md5=9dd64d2c93458a27c03de1ee9b7e176c

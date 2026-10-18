@@ -4,6 +4,12 @@
 
 No library, no accounts, no syncing, no store. It is written in C on the Win32 API, with a statically linked and patched copy of [MuPDF](https://mupdf.com) doing the document work.
 
+![Alice's Adventures in Wonderland as a two-page spread in the light theme](docs/screenshot-light.png)
+
+![The same spread in the dark theme, with the page previews sidebar open and search matches for "rabbit" highlighted](docs/screenshot-dark.png)
+
+![Single-page view, opening on Chapter IV](docs/screenshot-single.png)
+
 ## Features
 
 - **Formats:** EPUB, MOBI / AZW / AZW3, PDF, FB2, CBZ, TXT and HTML.

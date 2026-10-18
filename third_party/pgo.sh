@@ -1,11 +1,12 @@
 #!/bin/bash
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Profile-guided, link-time-optimized build of the MuPDF libs into build/pgo:
 #   1. instrumented build   2. training run on the sample books   3. optimized rebuild
 # usage: third_party/pgo.sh
 set -e
 cd "$(dirname "$0")"
 export PATH=/c/msys64/mingw64/bin:/c/msys64/usr/bin:$PATH
-mkdir -p /d/epub/src/third_party/tmp && export TMP="$(cygpath -w /d/epub/src/third_party/tmp)" TEMP="$(cygpath -w /d/epub/src/third_party/tmp)"
+mkdir -p "$ROOT/third_party/tmp" && export TMP="$(cygpath -w "$ROOT/third_party/tmp")" TEMP="$TMP"
 PGO="$(cygpath -m "$PWD")/pgo-data"
 OPT="-O3 -march=x86-64-v2 -flto=auto -fno-fat-lto-objects"
 MAKEARGS="OUT=build/pgo AR=gcc-ar RANLIB=gcc-ranlib"

@@ -1,4 +1,5 @@
 #!/bin/bash
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/." && pwd)"
 # Builds dpub.exe from main.c (UI), engine.c (MuPDF threads) and the static
 # MuPDF / mimalloc libraries in third_party (see README).
 #   bash build.sh            optimized build against the LTO+PGO MuPDF libs
@@ -6,7 +7,7 @@
 set -e
 cd "$(dirname "$0")"
 export PATH=/c/msys64/mingw64/bin:/c/msys64/usr/bin:$PATH
-mkdir -p /d/epub/src/third_party/tmp && export TMP="$(cygpath -w /d/epub/src/third_party/tmp)" TEMP="$(cygpath -w /d/epub/src/third_party/tmp)"
+mkdir -p "$ROOT/third_party/tmp" && export TMP="$(cygpath -w "$ROOT/third_party/tmp")" TEMP="$TMP"
 MU=third_party/mupdf-src
 MI=third_party/mimalloc
 

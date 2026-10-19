@@ -95,7 +95,7 @@ The rule is that the window never waits on the document.
 
 ### MuPDF changes
 
-MuPDF 1.27.0 is patched (`third_party/mupdf-patches.diff`). Each change was checked against a reference render, and the output is pixel-identical:
+MuPDF 1.27.0 is patched (`third_party/mupdf-patches.diff`). Each performance change was checked against a reference render, and the output is pixel-identical:
 
 | Change | Why |
 |---|---|
@@ -105,6 +105,7 @@ MuPDF 1.27.0 is patched (`third_party/mupdf-patches.diff`). Each change was chec
 | Per-box child index | Binary search finds the children that can touch a page, instead of scanning thousands of siblings. |
 | Lock-free allocation | With a thread-safe allocator (mimalloc), MuPDF no longer takes a global lock around every `malloc` / `free`. |
 | `fz_search_fold_text` | Exposes the search matcher's text normalisation so an index can agree with it exactly. |
+| SVG cover fallback | The SVG module is not built, so an inline `<svg>` that wraps a raster `<image>` (the usual Calibre or Gutenberg cover page) used to show `[image]`. It now shows the wrapped picture. This change is deliberate, so `bench/reference.txt` records its output for the EPUB samples. |
 
 The libraries are built with LTO and profile-guided optimisation, trained on real books, and use mimalloc as the allocator.
 
@@ -160,7 +161,7 @@ The result is a static, stripped `dpub.exe`. It imports only system DLLs: kernel
 bash bench/check.sh            # rebuild the tools, compare against bench/reference.txt, print timings
 ```
 
-`bench/verify.c` lays out every sample book at two font sizes. For each one it records the page count, an MD5 of the rendered pixels of sampled pages, and search hit counts. `reference.txt` holds the output of unmodified MuPDF, and any change to MuPDF must reproduce it exactly.
+`bench/verify.c` lays out every sample book at two font sizes. For each one it records the page count, an MD5 of the rendered pixels of sampled pages, and search hit counts. `reference.txt` holds the output of unmodified MuPDF, apart from the SVG cover fallback. Any change to MuPDF must reproduce it exactly.
 
 Other tools in `bench/`:
 

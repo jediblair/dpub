@@ -363,13 +363,69 @@ static void load_links(fz_page *page, Img *m)
 	fz_catch(ctx) {}
 }
 
+// Records where images land on the page, so dark mode can leave them untinted.
+#define MAX_IMG_BOXES 32
+typedef struct {
+	fz_device super;
+	fz_rect box[MAX_IMG_BOXES];
+	int n;
+} ImgBoxDev;
+
+static void imgbox_fill_image(fz_context *c, fz_device *d, fz_image *img, fz_matrix ctm, float alpha, fz_color_params cp)
+{
+	ImgBoxDev *b = (ImgBoxDev *)d;
+	fz_rect r = fz_transform_rect(fz_unit_rect, ctm);
+	if (fz_is_empty_rect(r)) return;
+	if (b->n < MAX_IMG_BOXES) b->box[b->n++] = r;
+	else b->box[MAX_IMG_BOXES - 1] = fz_union_rect(b->box[MAX_IMG_BOXES - 1], r);
+}
+
+// Draw `page` into `pix` (cleared to white first). Dark mode inverts the page
+// to light-on-dark, then redraws image areas so pictures keep their colours.
+static void draw_page(fz_page *page, fz_pixmap *pix, fz_matrix m, int dark)
+{
+	fz_device *volatile dev = NULL;
+	ImgBoxDev *volatile boxes = NULL;
+
+	fz_clear_pixmap_with_value(ctx, pix, 255);
+	fz_try(ctx) {
+		if (dark) {
+			boxes = fz_new_derived_device(ctx, ImgBoxDev);
+			boxes->super.fill_image = imgbox_fill_image;
+			fz_run_page(ctx, page, &boxes->super, m, NULL);
+			fz_close_device(ctx, &boxes->super);
+		}
+		dev = fz_new_draw_device(ctx, fz_identity, pix);
+		fz_run_page(ctx, page, dev, m, NULL);
+		fz_close_device(ctx, dev);
+		if (dark) {
+			fz_tint_pixmap(ctx, pix, 0xE0E0E0, 0x1E1E1E);
+			for (int i = 0; i < boxes->n; i++) {
+				fz_irect r = fz_intersect_irect(fz_round_rect(boxes->box[i]), fz_pixmap_bbox(ctx, pix));
+				if (fz_is_empty_irect(r)) continue;
+				fz_drop_device(ctx, dev);
+				dev = NULL;
+				fz_clear_pixmap_rect_with_value(ctx, pix, 255, r);
+				dev = fz_new_draw_device_with_bbox(ctx, fz_identity, pix, &r);
+				fz_run_page(ctx, page, dev, m, NULL);
+				fz_close_device(ctx, dev);
+			}
+		}
+	}
+	fz_always(ctx) {
+		fz_drop_device(ctx, dev);
+		fz_drop_device(ctx, (fz_device *)boxes);
+	}
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
 // Render a page for the current view: global page `pn`, or when the
 // document is not counted yet, the preview at `loc`.
 static int render(const Req *r, int pn, fz_location loc, int key)
 {
 	fz_page *volatile page = NULL;
 	fz_pixmap *volatile pix = NULL;
-	fz_device *volatile dev = NULL;
 	Img t = { 0 };
 
 	fz_try(ctx) {
@@ -385,11 +441,7 @@ static int render(const Req *r, int pn, fz_location loc, int key)
 		t.px = malloc((size_t)t.w * t.h * 4);
 		if (!t.px) fz_throw(ctx, FZ_ERROR_SYSTEM, "out of memory");
 		pix = fz_new_pixmap_with_bbox_and_data(ctx, fz_device_bgr(ctx), bb, NULL, 1, t.px);
-		fz_clear_pixmap_with_value(ctx, pix, 255);
-		dev = fz_new_draw_device(ctx, fz_identity, pix);
-		fz_run_page(ctx, page, dev, m, NULL);
-		fz_close_device(ctx, dev);
-		if (r->dark) fz_tint_pixmap(ctx, pix, 0xE0E0E0, 0x1E1E1E);
+		draw_page(page, pix, m, r->dark);
 
 		t.scale = scale;
 		t.bounds = to_box(b);
@@ -412,7 +464,6 @@ static int render(const Req *r, int pn, fz_location loc, int key)
 		t.hl_serial = hl_serial;
 	}
 	fz_always(ctx) {
-		fz_drop_device(ctx, dev);
 		fz_drop_pixmap(ctx, pix);
 		fz_drop_page(ctx, page);
 	}
@@ -442,7 +493,6 @@ static int render_thumb(int p, int tw, int dark)
 {
 	fz_page *volatile page = NULL;
 	fz_pixmap *volatile pix = NULL;
-	fz_device *volatile dev = NULL;
 	Thumb t = { 0 };
 
 	fz_try(ctx) {
@@ -456,14 +506,9 @@ static int render_thumb(int p, int tw, int dark)
 		t.px = malloc((size_t)t.w * t.h * 4);
 		if (!t.px) fz_throw(ctx, FZ_ERROR_SYSTEM, "out of memory");
 		pix = fz_new_pixmap_with_bbox_and_data(ctx, fz_device_bgr(ctx), bb, NULL, 1, t.px);
-		fz_clear_pixmap_with_value(ctx, pix, 255);
-		dev = fz_new_draw_device(ctx, fz_identity, pix);
-		fz_run_page(ctx, page, dev, m, NULL);
-		fz_close_device(ctx, dev);
-		if (dark) fz_tint_pixmap(ctx, pix, 0xE0E0E0, 0x1E1E1E);
+		draw_page(page, pix, m, dark);
 	}
 	fz_always(ctx) {
-		fz_drop_device(ctx, dev);
 		fz_drop_pixmap(ctx, pix);
 		fz_drop_page(ctx, page);
 	}

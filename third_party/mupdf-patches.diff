@@ -840,10 +840,32 @@ index 7a0a673..1edc98c 100644
  	fz_always(ctx)
  	{
 diff --git a/source/html/html-parse.c b/source/html/html-parse.c
-index de816eb..21461cc 100644
+index de816eb..d6d2978 100644
 --- a/source/html/html-parse.c
 +++ b/source/html/html-parse.c
-@@ -731,11 +731,15 @@ static void generate_image(fz_context *ctx, fz_html_box *box, fz_image *img, str
+@@ -695,6 +695,21 @@ static fz_image *load_svg_image(fz_context *ctx, fz_archive *zip, const char *ba
+ 		fz_warn(ctx, "html: cannot load embedded svg document");
+ 	}
+ #endif
++	/* Without SVG support, fall back to the first raster <image> inside the
++	 * svg. This covers the common calibre cover page, which is an svg that
++	 * only wraps a jpeg. */
++	if (!img)
++	{
++		fz_xml *child = fz_xml_find_dfs_top(node, "image", NULL, NULL, node);
++		if (child)
++		{
++			const char *src = fz_xml_att(child, "xlink:href");
++			if (!src)
++				src = fz_xml_att(child, "href");
++			if (src)
++				img = load_html_image(ctx, zip, base_uri, src);
++		}
++	}
+ 	return img;
+ }
+ 
+@@ -731,11 +746,15 @@ static void generate_image(fz_context *ctx, fz_html_box *box, fz_image *img, str
  	g->at_bol = 0;
  }
  
@@ -859,7 +881,7 @@ index de816eb..21461cc 100644
  		if (box->type == BOX_FLOW)
  			fz_drop_html_flow(ctx, box->u.flow.head);
  		fz_drop_html_box(ctx, box->down);
-@@ -1735,6 +1739,120 @@ static void fragment_cb(const uint32_t *fragment,
+@@ -1735,6 +1754,120 @@ static void fragment_cb(const uint32_t *fragment,
  	}
  }
  
@@ -980,7 +1002,7 @@ index de816eb..21461cc 100644
  static fz_bidi_direction
  detect_flow_directionality(fz_context *ctx, fz_pool *pool, uni_buf *buffer, fz_bidi_direction bidi_dir, fz_html_flow *flow)
  {
-@@ -1744,6 +1862,12 @@ detect_flow_directionality(fz_context *ctx, fz_pool *pool, uni_buf *buffer, fz_b
+@@ -1744,6 +1877,12 @@ detect_flow_directionality(fz_context *ctx, fz_pool *pool, uni_buf *buffer, fz_b
  	while (end)
  	{
  		unsigned int level = end->bidi_level;
